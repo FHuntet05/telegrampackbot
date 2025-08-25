@@ -65,6 +65,7 @@ def _get_task(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> asyncio.Task 
 def _clear_task(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     if 'tasks' in context.bot_data and user_id in context.bot_data['tasks']:
         del context.bot_data['tasks'][user_id]
+        logger.info(f"Tarea para el usuario {user_id} limpiada.")
 
 async def cancel_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manejador unificado para cancelar cualquier tarea en ejecución."""
@@ -75,13 +76,16 @@ async def cancel_task_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if task and not task.done():
         task.cancel()
         await query.answer("Enviando señal de cancelación...")
+        # La tarea llamará al callback que incluye _clear_task.
+        # Por seguridad, lo limpiamos también aquí por si la tarea se queda bloqueada.
+        _clear_task(context, user_id)
     else:
         await query.answer("No hay ninguna tarea activa para cancelar.", show_alert=True)
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except BadRequest:
             pass
-    # No limpiamos la tarea aquí, la propia tarea lo hará en su bloque 'finally'
+        _clear_task(context, user_id) # Limpiamos por si quedó una tarea fantasma
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
@@ -111,7 +115,7 @@ def clean_caption(original_caption: str | None) -> str:
     return re.sub(pattern, REPLACEMENT_USERNAME, original_caption)
 
 # --- LÓGICA DE PUBLICACIÓN DE PACKS (CANCELABLE) ---
-async def _publish_pack_logic(bot, pack_name: str, user_chat_id: int, status_message_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def _publish_pack_logic(bot, pack_name: str, user_chat_id: int, status_message_id: int, completion_callback: callable):
     task_cancelled = False
     try:
         pack_content = db.get_pack_for_sending(pack_name)
@@ -171,7 +175,8 @@ async def _publish_pack_logic(bot, pack_name: str, user_chat_id: int, status_mes
         await bot.send_message(chat_id=user_chat_id, text=f"🛑 Publicación del pack '{pack_name}' cancelada por el usuario.")
     
     finally:
-        _clear_task(context, user_chat_id)
+        if completion_callback:
+            completion_callback()
         try:
             final_text = f"Publicación {'cancelada' if task_cancelled else 'finalizada'}: '{pack_name}'"
             await bot.edit_message_text(chat_id=user_chat_id, message_id=status_message_id, text=final_text)
@@ -180,7 +185,7 @@ async def _publish_pack_logic(bot, pack_name: str, user_chat_id: int, status_mes
 
 async def publish_pack_job(pack_name: str, user_chat_id: int):
     application = Application.builder().token(BOT_TOKEN).build()
-    await _publish_pack_logic(application.bot, pack_name, user_chat_id, -1, application)
+    await _publish_pack_logic(application.bot, pack_name, user_chat_id, -1, None)
 
 async def send_pack_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -196,8 +201,11 @@ async def send_pack_now_callback(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar Publicación", callback_data="cancel_task")]])
     )
     
+    def completion_callback():
+        _clear_task(context, user_id)
+
     task = asyncio.create_task(
-        _publish_pack_logic(context.bot, pack_name, user_id, status_message.message_id, context)
+        _publish_pack_logic(context.bot, pack_name, user_id, status_message.message_id, completion_callback)
     )
     _store_task(context, user_id, task)
 
@@ -207,8 +215,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state')
     user_id = update.effective_user.id
     
-    # Prevenir nuevos comandos si una tarea está en ejecución (excepto durante la configuración del Modo Pro)
-    if _get_task(context, user_id) and state not in ['awaiting_source_link', 'awaiting_post_count']:
+    if _get_task(context, user_id) and state not in ['awaiting_source_link', 'awaiting_post_count', 'awaiting_subtitle_search', 'awaiting_subtitle_search_independent']:
         await update.message.reply_text("⏳ Hay una tarea en ejecución. Por favor, espera a que termine o cancelala.")
         return
     
@@ -297,13 +304,17 @@ async def handle_post_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Volviendo al menú principal...", reply_markup=MAIN_KEYBOARD)
     
+    def completion_callback():
+        _clear_task(context, user_id)
+
     task = asyncio.create_task(
         pro_mode.run_mirror_task(
             user_chat_id=user_id,
             start_link=start_link,
             post_count=count,
             bot=context.bot,
-            status_message_id=status_message.message_id
+            status_message_id=status_message.message_id,
+            completion_callback=completion_callback
         )
     )
     _store_task(context, user_id, task)
@@ -349,7 +360,6 @@ async def handle_immediate_video(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text("❌ Ocurrió un error inesperado al enviar el video.")
             return
     await update.message.reply_text("❌ No se pudo enviar el video por límites de Telegram.")
-
 
 # --- MENÚS Y COMANDOS PRINCIPALES ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -612,6 +622,70 @@ async def subtitle_search_start_callback(update: Update, context: ContextTypes.D
     context.user_data['photo_id'] = photo_id_str
     await query.message.reply_text("OK. ¿Qué película o serie busco? (Ej: `The Matrix`)", reply_markup=CANCEL_KEYBOARD)
     await query.delete_message()
+
+async def subtitle_search_independent_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['state'] = 'awaiting_subtitle_search_independent'
+    await update.message.reply_text("OK. ¿Qué película o serie busco?", reply_markup=CANCEL_KEYBOARD)
+
+async def handle_subtitle_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if _get_task(context, user_id):
+        await update.message.reply_text("⚠️ Ya tienes otra tarea en ejecución.")
+        return
+        
+    query_text = update.message.text
+    status_message = await update.message.reply_text(
+        f"🔎 Buscando subtítulos para '{query_text}'...",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar Búsqueda", callback_data="cancel_task")]])
+    )
+    
+    def completion_callback():
+        _clear_task(context, user_id)
+
+    task = asyncio.create_task(
+        _search_subtitles_logic(query_text, status_message, update, context, completion_callback)
+    )
+    _store_task(context, user_id, task)
+
+async def _search_subtitles_logic(query_text: str, status_message, update: Update, context: ContextTypes.DEFAULT_TYPE, completion_callback: callable):
+    task_cancelled = False
+    try:
+        subtitles, error_msg = await sub_api.search_subtitles(query_text)
+
+        if error_msg:
+            await status_message.edit_text(f"❌ Error: {error_msg}")
+            return
+        if not subtitles:
+            await status_message.edit_text("No se encontraron resultados. Intenta con otro nombre.")
+            return
+
+        keyboard = []
+        state = context.user_data.get('state')
+        for sub in subtitles[:10]:
+            season = f" S{sub['season']:02d}" if sub['season'] else ""
+            episode = f"E{sub['episode']:02d}" if sub['episode'] else ""
+            label = f"({sub['language']}) {sub['movie_name']}{season}{episode}"
+            if state == 'awaiting_subtitle_search_independent':
+                callback_data = f"sub_download_independent:{sub['file_id']}"
+            else:
+                pack_name = context.user_data['pack_name']
+                photo_id_str = context.user_data['photo_id']
+                callback_data = f"sub_download_pack:{pack_name}:{photo_id_str}:{sub['file_id']}"
+            keyboard.append([InlineKeyboardButton(label, callback_data=callback_data)])
+        
+        keyboard.append([InlineKeyboardButton("❌ Cancelar Búsqueda", callback_data="cancel_subtitle_search")])
+        await status_message.edit_text("Resultados encontrados. Selecciona uno para descargar:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    except asyncio.CancelledError:
+        task_cancelled = True
+        await status_message.edit_text("🛑 Búsqueda de subtítulos cancelada.")
+    
+    finally:
+        if completion_callback:
+            completion_callback()
+        if not task_cancelled:
+            # En caso de éxito, no borramos el mensaje, ya que contiene los resultados.
+            pass
 
 async def subtitle_download_independent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query

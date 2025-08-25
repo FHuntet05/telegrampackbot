@@ -1,4 +1,4 @@
-# pro_mode.py (Versión 10 - Cancelable)
+# pro_mode.py
 import os
 import asyncio
 import re
@@ -32,6 +32,7 @@ def clean_caption(original_caption: str | None) -> str:
     return re.sub(pattern, REPLACEMENT_USERNAME, original_caption)
 
 async def _send_with_retry(client_action, bot, user_chat_id):
+    """Función wrapper silenciosa para manejar FloodWaitError."""
     try:
         await client_action
         return True
@@ -48,7 +49,10 @@ async def _send_with_retry(client_action, bot, user_chat_id):
         return False
 
 async def _process_block(block: dict, bot, user_chat_id, client, my_channel_entity) -> tuple[int, int, str]:
-    videos_sent, errors = 0, 0
+    """Función aislada para procesar un solo bloque de contenido."""
+    videos_sent = 0
+    errors = 0
+    
     block_title = "Sin Título"
     if block["videos"] and block["videos"][0].text:
         block_title = block["videos"][0].text.split('\n')[0].strip()[:40] + "..."
@@ -83,13 +87,16 @@ async def _process_block(block: dict, bot, user_chat_id, client, my_channel_enti
             os.remove(photo_temp_path)
 
 
-async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, bot, status_message_id: int):
+async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, bot, status_message_id: int, completion_callback: callable):
     """
     Tarea principal que ahora es cancelable y limpia su mensaje de estado al finalizar.
     """
-    total_blocks_processed, total_videos_sent, total_errors = 0, 0, 0
+    total_blocks_processed = 0
+    total_videos_sent = 0
+    total_errors = 0
     summary_details = []
     task_cancelled = False
+    final_status = "Completada"
 
     try:
         async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
@@ -136,16 +143,18 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
     
     except asyncio.CancelledError:
         task_cancelled = True
+        final_status = "Cancelada"
         await bot.send_message(user_chat_id, "🛑 **Misión Cancelada por el Usuario.**")
     
     except Exception as e:
+        final_status = "Fallida por Error"
         await bot.send_message(user_chat_id, f"❌ MISIÓN ABORTADA: Error crítico general: {e}")
     
     finally:
-        # Enviar el informe final solo si no fue cancelada
-        if not task_cancelled:
+        # Enviar el informe final solo si no fue cancelada y se procesó algo
+        if not task_cancelled and (total_blocks_processed > 0 or total_errors > 0):
             final_summary = (
-                f"🎉 **Misión Completada** 🎉\n\n"
+                f"🎉 **Misión Finalizada** 🎉\n\n"
                 f"📄 **Resumen de Operaciones:**\n"
                 f"- 🏙️ Bloques Procesados: *{total_blocks_processed} de {post_count} solicitados*\n"
                 f"- 📹 Videos Totales Enviados: *{total_videos_sent}*\n"
@@ -155,12 +164,16 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
             )
             await bot.send_message(user_chat_id, final_summary, parse_mode=ParseMode.MARKDOWN)
 
-        # Limpiar el mensaje de estado (quitar el botón de cancelar)
+        # Limpiar el mensaje de estado
         try:
             await bot.edit_message_text(
                 chat_id=user_chat_id,
                 message_id=status_message_id,
-                text=f"✅ Tarea finalizada (estado: {'Cancelada' if task_cancelled else 'Completada'})."
+                text=f"✅ Tarea finalizada (estado: {final_status})."
             )
         except BadRequest:
-            pass # El mensaje podría haber sido borrado, lo ignoramos
+            pass
+        
+        # Ejecutar el callback para limpiar la referencia de la tarea en bot.py
+        if completion_callback:
+            completion_callback()
