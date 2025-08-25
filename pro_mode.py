@@ -1,4 +1,4 @@
-# pro_mode.py (Versión Corregida 8 - Lógica de Acumulación con un solo iterador)
+# pro_mode.py (Versión Corregida 9 - Modo Paciente con Pausas de Cortesía)
 import os
 import asyncio
 import re
@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageService, PeerChannel, Message
+from telethon.tl.types import MessageService, PeerChannel
 from telethon.tl.functions.channels import EditPhotoRequest
 from telethon.errors.rpcerrorlist import FloodWaitError, ChannelPrivateError
 from telegram.constants import ParseMode
@@ -38,7 +38,8 @@ async def _send_with_retry(client_action, bot, user_chat_id):
     except FloodWaitError as fwe:
         if fwe.seconds > 10:
              await bot.send_message(user_chat_id, f"⏳ Telegram está ocupado. El bot esperará automáticamente {fwe.seconds} segundos y continuará.")
-        await asyncio.sleep(fwe.seconds + 1)
+        # Esperamos el tiempo solicitado + un margen
+        await asyncio.sleep(fwe.seconds + 2)
         try:
             await client_action
             return True
@@ -69,6 +70,8 @@ async def _process_block(block: dict, bot, user_chat_id, client, my_channel_enti
                 return 0, errors, f"❌ *{block_title}*: Error al actualizar foto."
 
         for video_msg in block["videos"]:
+            # --- PAUSA PEQUEÑA ENTRE CADA VIDEO ---
+            await asyncio.sleep(1) 
             new_caption = clean_caption(video_msg.text)
             action = client.send_file(my_channel_entity, video_msg.media, caption=new_caption)
             if await _send_with_retry(action, bot, user_chat_id):
@@ -87,7 +90,7 @@ async def _process_block(block: dict, bot, user_chat_id, client, my_channel_enti
 
 async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, bot):
     """
-    Tarea principal que usa una lógica de acumulación con un solo iterador para máxima eficiencia y respeto a la API.
+    Tarea principal que usa una lógica de acumulación con pausas de cortesía.
     """
     total_blocks_processed = 0
     total_videos_sent = 0
@@ -97,7 +100,7 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
     async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
         try:
             me = await client.get_me()
-            await bot.send_message(user_chat_id, f"🤖 Agente '{me.first_name}' activado. Iniciando escaneo eficiente para {post_count} bloques. Recibirás un informe al finalizar.")
+            await bot.send_message(user_chat_id, f"🤖 Agente '{me.first_name}' activado. Iniciando escaneo paciente para {post_count} bloques. Recibirás un informe al finalizar.")
 
             source_channel_id, start_msg_id = parse_private_link(start_link)
             if not source_channel_id:
@@ -112,28 +115,27 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
                  return
 
             current_block = {}
-            # Usamos un solo iterador
-            async for message in client.iter_messages(source_channel_entity, offset_id=start_msg_id, reverse=True):
+            # --- PARÁMETRO CLAVE AÑADIDO: wait_time ---
+            # Le decimos a Telethon que espere 2 segundos entre cada petición de lote de mensajes.
+            async for message in client.iter_messages(source_channel_entity, offset_id=start_msg_id, reverse=True, wait_time=2):
                 if total_blocks_processed >= post_count:
                     break
 
                 if isinstance(message, MessageService) and message.action and hasattr(message.action, 'photo'):
-                    # Encontramos el inicio de un nuevo bloque. Primero, procesamos el bloque anterior si tenía videos.
                     if current_block.get("videos"):
                         sent, errs, summary = await _process_block(current_block, bot, user_chat_id, client, my_channel_entity)
                         total_videos_sent += sent
                         total_errors += errs
                         summary_details.append(summary)
                         total_blocks_processed += 1
+                        # --- PAUSA ENTRE BLOQUES PROCESADOS ---
+                        await asyncio.sleep(3) 
                     
-                    # Iniciamos el nuevo bloque
                     current_block = {"photo_msg": message, "videos": []}
                 
                 elif message.video and current_block:
-                    # Si estamos dentro de un bloque, acumulamos el video
                     current_block.setdefault("videos", []).append(message)
             
-            # Al final del bucle, puede quedar un último bloque sin procesar. Lo procesamos aquí.
             if total_blocks_processed < post_count and current_block.get("videos"):
                 sent, errs, summary = await _process_block(current_block, bot, user_chat_id, client, my_channel_entity)
                 total_videos_sent += sent
