@@ -76,8 +76,6 @@ async def cancel_task_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if task and not task.done():
         task.cancel()
         await query.answer("Enviando señal de cancelación...")
-        # La tarea llamará al callback que incluye _clear_task.
-        # Por seguridad, lo limpiamos también aquí por si la tarea se queda bloqueada.
         _clear_task(context, user_id)
     else:
         await query.answer("No hay ninguna tarea activa para cancelar.", show_alert=True)
@@ -85,7 +83,7 @@ async def cancel_task_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_reply_markup(reply_markup=None)
         except BadRequest:
             pass
-        _clear_task(context, user_id) # Limpiamos por si quedó una tarea fantasma
+        _clear_task(context, user_id)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
@@ -650,7 +648,8 @@ async def handle_subtitle_search_query(update: Update, context: ContextTypes.DEF
 async def _search_subtitles_logic(query_text: str, status_message, update: Update, context: ContextTypes.DEFAULT_TYPE, completion_callback: callable):
     task_cancelled = False
     try:
-        subtitles, error_msg = await sub_api.search_subtitles(query_text)
+        # CORRECCIÓN: Usar asyncio.to_thread para no bloquear el bot
+        subtitles, error_msg = await asyncio.to_thread(sub_api.search_subtitles, query_text)
 
         if error_msg:
             await status_message.edit_text(f"❌ Error: {error_msg}")
@@ -674,7 +673,7 @@ async def _search_subtitles_logic(query_text: str, status_message, update: Updat
             keyboard.append([InlineKeyboardButton(label, callback_data=callback_data)])
         
         keyboard.append([InlineKeyboardButton("❌ Cancelar Búsqueda", callback_data="cancel_subtitle_search")])
-        await status_message.edit_text("Resultados encontrados. Selecciona uno para descargar:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await status_message.edit_text("Resultados encontrados. Selecciona uno:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     except asyncio.CancelledError:
         task_cancelled = True
@@ -683,9 +682,12 @@ async def _search_subtitles_logic(query_text: str, status_message, update: Updat
     finally:
         if completion_callback:
             completion_callback()
-        if not task_cancelled:
-            # En caso de éxito, no borramos el mensaje, ya que contiene los resultados.
-            pass
+        if task_cancelled:
+            try:
+                await status_message.edit_text("🛑 Búsqueda cancelada.")
+            except BadRequest:
+                pass
+        # Si no se canceló, el mensaje ya muestra los resultados o un error, no lo tocamos.
 
 async def subtitle_download_independent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
