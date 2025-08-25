@@ -1,4 +1,4 @@
-# pro_mode.py (Versión Corregida)
+# pro_mode.py (Versión Corregida 3)
 import os
 import asyncio
 import re
@@ -16,9 +16,8 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 REPLACEMENT_USERNAME = os.getenv("REPLACEMENT_USERNAME", "@estrenos_fh")
-MY_CHANNEL_ID = int(os.getenv("CHANNEL_ID")) # El ID de tu canal, donde se publicará
+MY_CHANNEL_ID = int(os.getenv("CHANNEL_ID")) 
 
-# --- NUEVA FUNCIÓN ---
 def parse_private_link(link: str) -> tuple[int | None, int | None]:
     """Extrae el ID del canal y del mensaje de un enlace t.me/c/."""
     match = re.match(r"https?://t\.me/c/(\d+)/(\d+)", link)
@@ -42,14 +41,12 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
             me = await client.get_me()
             await bot.send_message(user_chat_id, f"🤖 Conectado como '{me.first_name}'. Iniciando proceso...")
 
-            # --- LÓGICA DE ENLACE CORREGIDA ---
             source_channel_id, start_msg_id = parse_private_link(start_link)
             if not source_channel_id or not start_msg_id:
                 await bot.send_message(user_chat_id, f"❌ ERROR: El formato del enlace privado no es correcto. Debe ser `t.me/c/ID_CANAL/ID_MENSAJE`.")
                 return
 
             try:
-                # Forma más robusta de obtener el canal usando su ID numérico
                 source_channel_entity = await client.get_entity(PeerChannel(source_channel_id))
             except (ValueError, ChannelPrivateError):
                  await bot.send_message(user_chat_id, f"❌ ERROR: No se pudo acceder al canal con ID `{source_channel_id}`. Asegúrate de que la cuenta '{me.first_name}' es miembro del canal.")
@@ -60,7 +57,6 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
             my_channel_entity = await client.get_entity(MY_CHANNEL_ID)
             processed_count = 0
 
-            # Damos más margen para buscar los mensajes, por si hay texto o cosas que no son bloques.
             search_limit = post_count * 10
             await bot.send_message(user_chat_id, f"🔍 Buscando {post_count} bloques dentro de los próximos {search_limit} mensajes...")
 
@@ -70,6 +66,7 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
                     break
                 
                 if isinstance(message, MessageService) and message.action and hasattr(message.action, 'photo'):
+                    photo_temp_path = None # Inicializamos la variable
                     try:
                         photo_update_msg = message
                         async for next_msg in client.iter_messages(source_channel_entity, offset_id=photo_update_msg.id, reverse=True, limit=1):
@@ -82,10 +79,14 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
                         await bot.send_message(user_chat_id, f"✅ Bloque {processed_count + 1}/{post_count} encontrado (ID: {photo_update_msg.id}). Procesando...")
                         
                         photo = photo_update_msg.action.photo
-                        photo_path = await client.download_media(photo, file=bytes)
                         
-                        if photo_path:
-                            uploaded_file = await client.upload_file(photo_path)
+                        # --- LÓGICA DE FOTO CORREGIDA ---
+                        # 1. Descargar a un archivo temporal con extensión
+                        photo_temp_path = await client.download_media(photo, file=f"./temp_{message.id}.jpg")
+                        
+                        if photo_temp_path:
+                            # 2. Subir desde el archivo en disco
+                            uploaded_file = await client.upload_file(photo_temp_path)
                             await client(EditPhotoRequest(channel=my_channel_entity, photo=uploaded_file))
                             await bot.send_message(user_chat_id, f"🖼️ Foto de perfil actualizada.")
                             await asyncio.sleep(5) 
@@ -106,6 +107,10 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
                         if len(error_msg) > 300: error_msg = error_msg[:300] + "..."
                         await bot.send_message(user_chat_id, f"⚠️ Error procesando un bloque: `{error_msg}`. Saltando al siguiente.")
                         continue
+                    finally:
+                        # 3. Asegurarnos de borrar el archivo temporal
+                        if photo_temp_path and os.path.exists(photo_temp_path):
+                            os.remove(photo_temp_path)
             
             await bot.send_message(user_chat_id, f"🎉 ¡Tarea completada! Se procesaron {processed_count} de los {post_count} solicitados.")
 
