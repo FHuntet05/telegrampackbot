@@ -25,6 +25,7 @@ from apscheduler.jobstores.mongodb import MongoDBJobStore
 
 import database as db
 import subtitles as sub_api
+import pro_mode # Importamos el nuevo módulo para el Modo Pro
 
 # --- Cargar y Configurar ---
 load_dotenv()
@@ -42,7 +43,12 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # --- Teclados Personalizados ---
-MAIN_KEYBOARD = ReplyKeyboardMarkup([["📦 Crear Pack"], ["📋 Gestionar Packs"], ["🔎 Buscar Subtítulos"]], resize_keyboard=True)
+MAIN_KEYBOARD = ReplyKeyboardMarkup([
+    ["📦 Crear Pack"], 
+    ["📋 Gestionar Packs"], 
+    ["🔎 Buscar Subtítulos"],
+    ["🚀 Activar Modo Pro"] # Nuevo botón
+], resize_keyboard=True)
 EDITING_KEYBOARD = ReplyKeyboardMarkup([["✅ Terminar Creación/Edición"]], resize_keyboard=True)
 CANCEL_KEYBOARD = ReplyKeyboardMarkup([["❌ Cancelar"]], resize_keyboard=True)
 
@@ -153,20 +159,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pack_create_start(update, context)
     elif text == "📋 Gestionar Packs":
         await list_packs_command(update, context)
-    # <<< CORRECCIÓN: NOMBRE DE LA FUNCIÓN >>>
     elif text == "✅ Terminar Creación/Edición":
         await finish_creation_editing(update, context)
     elif text == "❌ Cancelar":
         await cancel_action(update, context)
     elif text == "🔎 Buscar Subtítulos":
         await subtitle_search_independent_start(update, context)
+    elif text == "🚀 Activar Modo Pro": # NUEVO
+        await start_modo_pro(update, context)
     elif state == 'awaiting_pack_name':
         await pack_await_name(update, context)
     elif state in ['awaiting_subtitle_search', 'awaiting_subtitle_search_independent']:
         await handle_subtitle_search_query(update, context)
+    elif state == 'awaiting_source_link': # NUEVO
+        await handle_source_link(update, context)
+    elif state == 'awaiting_post_count': # NUEVO
+        await handle_post_count(update, context)
     elif state in ['creating_pack', 'editing_pack']:
         await update.message.reply_text("Estoy esperando una foto o un video. Si no quieres añadir más, pulsa 'Terminar Creación/Edición'.")
-
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('state') in ['creating_pack', 'editing_pack']:
@@ -185,6 +195,64 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('state') == 'awaiting_subtitle':
         await add_subtitle_to_photo_flow(update, context)
+
+# --- MODO PRO (NUEVO) ---
+async def start_modo_pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia el flujo de configuración del Modo Pro."""
+    context.user_data.clear() # Limpiamos cualquier estado anterior
+    context.user_data['state'] = 'awaiting_source_link'
+    await update.message.reply_text(
+        "🚀 Modo Pro Activado.\n\n"
+        "Por favor, ve al canal fuente (privado o público) y reenvíame o copia el enlace del **último video que ya publicaste** en tu canal.\n\n"
+        "Este será el punto de partida.",
+        reply_markup=CANCEL_KEYBOARD
+    )
+
+async def handle_source_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe y valida el enlace del mensaje de inicio."""
+    link = update.message.text
+    if "t.me" not in link or "/" not in link:
+        await update.message.reply_text("❌ El enlace no parece válido. Por favor, envía un enlace de mensaje de Telegram. (Ej: https://t.me/c/123456789/123)")
+        return
+        
+    context.user_data['start_link'] = link
+    context.user_data['state'] = 'awaiting_post_count'
+    await update.message.reply_text(
+        "✅ Enlace recibido.\n\n"
+        "Ahora, dime cuántos bloques de contenido (Foto + Video) quieres que procese desde ese punto en adelante.\n\n"
+        "Escribe solo un número (ej: `20`).",
+        reply_markup=CANCEL_KEYBOARD
+    )
+
+async def handle_post_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe el número de posts a procesar y lanza la tarea."""
+    try:
+        count = int(update.message.text)
+        if count <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Por favor, introduce un número entero positivo.")
+        return
+
+    start_link = context.user_data['start_link']
+    
+    await update.message.reply_text(
+        f"⏳ ¡Entendido! Iniciando la tarea de procesar {count} bloques.\n\n"
+        "Esto puede tardar. Te notificaré sobre el progreso. Ya puedes volver a usar otros comandos.",
+        reply_markup=MAIN_KEYBOARD
+    )
+    
+    context.user_data.clear()
+    
+    # Lanzamos la tarea pesada en segundo plano para no bloquear el bot
+    asyncio.create_task(
+        pro_mode.run_mirror_task(
+            user_chat_id=update.effective_chat.id,
+            start_link=start_link,
+            post_count=count,
+            bot=context.bot # Pasamos la instancia del bot para que pueda enviar notificaciones
+        )
+    )
 
 # --- MODO INMEDIATO ---
 async def handle_immediate_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
