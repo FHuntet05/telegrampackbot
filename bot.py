@@ -25,7 +25,7 @@ from apscheduler.jobstores.mongodb import MongoDBJobStore
 
 import database as db
 import subtitles as sub_api
-import pro_mode # Importamos el nuevo módulo para el Modo Pro
+import pro_mode
 
 # --- Cargar y Configurar ---
 load_dotenv()
@@ -47,14 +47,47 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup([
     ["📦 Crear Pack"], 
     ["📋 Gestionar Packs"], 
     ["🔎 Buscar Subtítulos"],
-    ["🚀 Activar Modo Pro"] # Nuevo botón
+    ["🚀 Activar Modo Pro"]
 ], resize_keyboard=True)
 EDITING_KEYBOARD = ReplyKeyboardMarkup([["✅ Terminar Creación/Edición"]], resize_keyboard=True)
 CANCEL_KEYBOARD = ReplyKeyboardMarkup([["❌ Cancelar"]], resize_keyboard=True)
 
-# --- GESTOR DE ERRORES Y UTILIDADES ---
+# --- GESTOR DE TAREAS Y ERRORES ---
+
+def _store_task(context: ContextTypes.DEFAULT_TYPE, user_id: int, task: asyncio.Task):
+    if 'tasks' not in context.bot_data:
+        context.bot_data['tasks'] = {}
+    context.bot_data['tasks'][user_id] = task
+
+def _get_task(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> asyncio.Task | None:
+    return context.bot_data.get('tasks', {}).get(user_id)
+
+def _clear_task(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    if 'tasks' in context.bot_data and user_id in context.bot_data['tasks']:
+        del context.bot_data['tasks'][user_id]
+
+async def cancel_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manejador unificado para cancelar cualquier tarea en ejecución."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    task = _get_task(context, user_id)
+    if task and not task.done():
+        task.cancel()
+        await query.answer("Enviando señal de cancelación...")
+    else:
+        await query.answer("No hay ninguna tarea activa para cancelar.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass
+    # No limpiamos la tarea aquí, la propia tarea lo hará en su bloque 'finally'
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
+    user_id = update.effective_user.id if hasattr(update, 'effective_user') and update.effective_user else ADMIN_USER_ID
+    _clear_task(context, user_id)
+
     tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
     tb_string = "".join(tb_list)
     update_str = str(update.to_dict()) if isinstance(update, Update) else str(update)
@@ -67,7 +100,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             logger.error(f"No se pudo enviar parte del log de error: {e}")
     if isinstance(update, Update) and update.effective_chat:
         try:
-            await update.effective_chat.send_message("❌ Ups, algo salió mal. Volviendo al menú principal.", reply_markup=MAIN_KEYBOARD)
+            await update.effective_chat.send_message("❌ Ups, algo salió mal. Tarea cancelada. Volviendo al menú principal.", reply_markup=MAIN_KEYBOARD)
         except Exception as e:
             logger.error(f"No se pudo enviar el mensaje de error de recuperación al usuario: {e}")
     context.user_data.clear()
@@ -77,83 +110,107 @@ def clean_caption(original_caption: str | None) -> str:
     pattern = r'@\w+|https?://t\.me/\S+'
     return re.sub(pattern, REPLACEMENT_USERNAME, original_caption)
 
-# --- LÓGICA DE PUBLICACIÓN CENTRALIZADA Y ROBUSTA ---
-async def _publish_pack_logic(bot, pack_name: str, user_chat_id: int):
-    pack_content = db.get_pack_for_sending(pack_name)
-    if not pack_content:
-        await bot.send_message(chat_id=user_chat_id, text=f"❌ Error: El pack '{pack_name}' está vacío o no existe.")
-        return
+# --- LÓGICA DE PUBLICACIÓN DE PACKS (CANCELABLE) ---
+async def _publish_pack_logic(bot, pack_name: str, user_chat_id: int, status_message_id: int, context: ContextTypes.DEFAULT_TYPE):
+    task_cancelled = False
+    try:
+        pack_content = db.get_pack_for_sending(pack_name)
+        if not pack_content:
+            await bot.send_message(chat_id=user_chat_id, text=f"❌ Error: El pack '{pack_name}' está vacío o no existe.")
+            return
 
-    photo_index = 0
-    while photo_index < len(pack_content):
-        item = pack_content[photo_index]
-        photo_sent = False
-        video_index = 0
-        
-        for attempt in range(5):
-            try:
-                if not photo_sent:
-                    temp_photo_path = None
-                    try:
-                        photo_file_obj = await bot.get_file(item['photo_file_id'])
-                        temp_photo_path = f"./{photo_file_obj.file_unique_id}.jpg"
-                        await photo_file_obj.download_to_drive(custom_path=temp_photo_path)
-                        with open(temp_photo_path, 'rb') as photo_to_upload:
-                            await bot.set_chat_photo(chat_id=CHANNEL_ID, photo=photo_to_upload)
-                        await bot.send_message(chat_id=user_chat_id, text=f"({photo_index + 1}/{len(pack_content)}) Foto de perfil actualizada. Enviando adjuntos...")
-                        photo_sent = True
-                    finally:
-                        if temp_photo_path and os.path.exists(temp_photo_path):
-                            os.remove(temp_photo_path)
-                
-                videos = item.get('videos', [])
-                while video_index < len(videos):
-                    video = videos[video_index]
-                    if video.get('caption', '').startswith("SUBTITLE:"):
-                        await bot.send_document(chat_id=CHANNEL_ID, document=video['file_id'], caption=video['caption'].replace("SUBTITLE:", "Subtítulo:"))
-                    else:
-                        await bot.send_video(chat_id=CHANNEL_ID, video=video['file_id'], caption=clean_caption(video.get('caption')))
-                    video_index += 1
-                    await asyncio.sleep(1.5)
-
-                logger.info(f"Item {photo_index + 1} del pack '{pack_name}' publicado con éxito.")
-                break 
+        for photo_index, item in enumerate(pack_content):
+            await bot.edit_message_text(
+                chat_id=user_chat_id,
+                message_id=status_message_id,
+                text=f"🚀 Publicando pack '{pack_name}'...\n\n"
+                     f"Progreso: Foto {photo_index + 1}/{len(pack_content)}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar Publicación", callback_data="cancel_task")]])
+            )
             
-            except RetryAfter as e:
-                logger.warning(f"Flood control detectado. Esperando {e.retry_after}s. Intento {attempt + 1}/5.")
-                await bot.send_message(chat_id=user_chat_id, text=f"⏳ Telegram ocupado. Reintentando en {e.retry_after + 1} segundos...")
-                await asyncio.sleep(e.retry_after + 1)
+            photo_sent = False
+            video_index = 0
+            for attempt in range(5):
+                try:
+                    if not photo_sent:
+                        temp_photo_path = None
+                        try:
+                            photo_file_obj = await bot.get_file(item['photo_file_id'])
+                            temp_photo_path = f"./{photo_file_obj.file_unique_id}.jpg"
+                            await photo_file_obj.download_to_drive(custom_path=temp_photo_path)
+                            with open(temp_photo_path, 'rb') as photo_to_upload:
+                                await bot.set_chat_photo(chat_id=CHANNEL_ID, photo=photo_to_upload)
+                            photo_sent = True
+                        finally:
+                            if temp_photo_path and os.path.exists(temp_photo_path):
+                                os.remove(temp_photo_path)
+                    
+                    videos = item.get('videos', [])
+                    while video_index < len(videos):
+                        video = videos[video_index]
+                        if video.get('caption', '').startswith("SUBTITLE:"):
+                            await bot.send_document(chat_id=CHANNEL_ID, document=video['file_id'], caption=video['caption'].replace("SUBTITLE:", "Subtítulo:"))
+                        else:
+                            await bot.send_video(chat_id=CHANNEL_ID, video=video['file_id'], caption=clean_caption(video.get('caption')))
+                        video_index += 1
+                        await asyncio.sleep(1.5)
+                    break
+                except RetryAfter as e:
+                    await bot.send_message(chat_id=user_chat_id, text=f"⏳ Telegram ocupado. Reintentando en {e.retry_after + 1} segundos...")
+                    await asyncio.sleep(e.retry_after + 1)
+                except Exception as e:
+                    await bot.send_message(chat_id=user_chat_id, text=f"⚠️ Ocurrió un error grave publicando un item. Saltando al siguiente.")
+                    break
             
-            except Exception as e:
-                logger.error(f"Error irrecuperable publicando item del pack {pack_name}: {e}")
-                await bot.send_message(chat_id=user_chat_id, text=f"⚠️ Ocurrió un error grave publicando un item del pack '{pack_name}'. Saltando al siguiente.")
-                break 
-        else: 
-            logger.error(f"No se pudo publicar el item {photo_index + 1} del pack '{pack_name}' después de varios reintentos.")
-            await bot.send_message(chat_id=user_chat_id, text=f"❌ Falló la publicación del item {photo_index + 1} del pack '{pack_name}' por límites de Telegram.")
-        
-        photo_index += 1
+            await asyncio.sleep(0.01)
 
-    await bot.send_message(chat_id=user_chat_id, text=f"✅ Publicación del pack '{pack_name}' finalizada.", reply_markup=MAIN_KEYBOARD)
+        await bot.send_message(chat_id=user_chat_id, text=f"✅ Publicación del pack '{pack_name}' finalizada.", reply_markup=MAIN_KEYBOARD)
+
+    except asyncio.CancelledError:
+        task_cancelled = True
+        await bot.send_message(chat_id=user_chat_id, text=f"🛑 Publicación del pack '{pack_name}' cancelada por el usuario.")
+    
+    finally:
+        _clear_task(context, user_chat_id)
+        try:
+            final_text = f"Publicación {'cancelada' if task_cancelled else 'finalizada'}: '{pack_name}'"
+            await bot.edit_message_text(chat_id=user_chat_id, message_id=status_message_id, text=final_text)
+        except BadRequest:
+            pass
 
 async def publish_pack_job(pack_name: str, user_chat_id: int):
     application = Application.builder().token(BOT_TOKEN).build()
-    await _publish_pack_logic(application.bot, pack_name, user_chat_id)
+    await _publish_pack_logic(application.bot, pack_name, user_chat_id, -1, application)
 
 async def send_pack_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     _, pack_name = query.data.split(":", 1)
-    await query.edit_message_text(f"🚀 Iniciando publicación del pack '{pack_name}'. Esto puede tardar...")
-    await _publish_pack_logic(context.bot, pack_name, update.effective_chat.id)
-    try:
-        await query.delete_message()
-    except Exception:
-        pass
+    user_id = update.effective_user.id
+
+    if _get_task(context, user_id):
+        await query.answer("⚠️ Ya tienes otra tarea en ejecución.", show_alert=True)
+        return
+
+    status_message = await query.edit_message_text(
+        f"🚀 Preparando la publicación del pack '{pack_name}'...",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar Publicación", callback_data="cancel_task")]])
+    )
+    
+    task = asyncio.create_task(
+        _publish_pack_logic(context.bot, pack_name, user_id, status_message.message_id, context)
+    )
+    _store_task(context, user_id, task)
 
 # --- GESTORES CENTRALES DE MENSAJES ---
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     state = context.user_data.get('state')
+    user_id = update.effective_user.id
+    
+    # Prevenir nuevos comandos si una tarea está en ejecución (excepto durante la configuración del Modo Pro)
+    if _get_task(context, user_id) and state not in ['awaiting_source_link', 'awaiting_post_count']:
+        await update.message.reply_text("⏳ Hay una tarea en ejecución. Por favor, espera a que termine o cancelala.")
+        return
     
     if text == "📦 Crear Pack":
         await pack_create_start(update, context)
@@ -165,15 +222,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cancel_action(update, context)
     elif text == "🔎 Buscar Subtítulos":
         await subtitle_search_independent_start(update, context)
-    elif text == "🚀 Activar Modo Pro": # NUEVO
+    elif text == "🚀 Activar Modo Pro":
         await start_modo_pro(update, context)
     elif state == 'awaiting_pack_name':
         await pack_await_name(update, context)
     elif state in ['awaiting_subtitle_search', 'awaiting_subtitle_search_independent']:
         await handle_subtitle_search_query(update, context)
-    elif state == 'awaiting_source_link': # NUEVO
+    elif state == 'awaiting_source_link':
         await handle_source_link(update, context)
-    elif state == 'awaiting_post_count': # NUEVO
+    elif state == 'awaiting_post_count':
         await handle_post_count(update, context)
     elif state in ['creating_pack', 'editing_pack']:
         await update.message.reply_text("Estoy esperando una foto o un video. Si no quieres añadir más, pulsa 'Terminar Creación/Edición'.")
@@ -196,63 +253,60 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('state') == 'awaiting_subtitle':
         await add_subtitle_to_photo_flow(update, context)
 
-# --- MODO PRO (NUEVO) ---
+# --- MODO PRO (CANCELABLE) ---
 async def start_modo_pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia el flujo de configuración del Modo Pro."""
-    context.user_data.clear() # Limpiamos cualquier estado anterior
+    user_id = update.effective_user.id
+    if _get_task(context, user_id):
+        await update.message.reply_text("⚠️ Ya hay una tarea del Modo Pro en ejecución. Por favor, cancelala primero o espera a que termine.")
+        return
+            
+    context.user_data.clear()
     context.user_data['state'] = 'awaiting_source_link'
     await update.message.reply_text(
         "🚀 Modo Pro Activado.\n\n"
-        "Por favor, ve al canal fuente (privado o público) y reenvíame o copia el enlace del **último video que ya publicaste** en tu canal.\n\n"
-        "Este será el punto de partida.",
+        "Envíame el enlace del **último video que ya publicaste**.",
         reply_markup=CANCEL_KEYBOARD
     )
 
 async def handle_source_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe y valida el enlace del mensaje de inicio."""
     link = update.message.text
     if "t.me" not in link or "/" not in link:
-        await update.message.reply_text("❌ El enlace no parece válido. Por favor, envía un enlace de mensaje de Telegram. (Ej: https://t.me/c/123456789/123)")
+        await update.message.reply_text("❌ Enlace no válido. Por favor, envía un enlace de mensaje de Telegram.")
         return
         
     context.user_data['start_link'] = link
     context.user_data['state'] = 'awaiting_post_count'
-    await update.message.reply_text(
-        "✅ Enlace recibido.\n\n"
-        "Ahora, dime cuántos bloques de contenido (Foto + Video) quieres que procese desde ese punto en adelante.\n\n"
-        "Escribe solo un número (ej: `20`).",
-        reply_markup=CANCEL_KEYBOARD
-    )
+    await update.message.reply_text( "✅ Enlace recibido. Ahora, ¿cuántos bloques quieres procesar?", reply_markup=CANCEL_KEYBOARD)
 
 async def handle_post_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe el número de posts a procesar y lanza la tarea."""
     try:
         count = int(update.message.text)
-        if count <= 0:
-            raise ValueError
+        if count <= 0: raise ValueError
     except ValueError:
         await update.message.reply_text("❌ Por favor, introduce un número entero positivo.")
         return
 
     start_link = context.user_data['start_link']
+    user_id = update.effective_user.id
     
-    await update.message.reply_text(
-        f"⏳ ¡Entendido! Iniciando la tarea de procesar {count} bloques.\n\n"
-        "Esto puede tardar. Te notificaré sobre el progreso. Ya puedes volver a usar otros comandos.",
-        reply_markup=MAIN_KEYBOARD
+    status_message = await update.message.reply_text(
+        f"⏳ Iniciando tarea para procesar {count} bloques. Puedes cancelarla en cualquier momento.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar Proceso", callback_data="cancel_task")]])
     )
     
     context.user_data.clear()
+    await update.message.reply_text("Volviendo al menú principal...", reply_markup=MAIN_KEYBOARD)
     
-    # Lanzamos la tarea pesada en segundo plano para no bloquear el bot
-    asyncio.create_task(
+    task = asyncio.create_task(
         pro_mode.run_mirror_task(
-            user_chat_id=update.effective_chat.id,
+            user_chat_id=user_id,
             start_link=start_link,
             post_count=count,
-            bot=context.bot # Pasamos la instancia del bot para que pueda enviar notificaciones
+            bot=context.bot,
+            status_message_id=status_message.message_id
         )
     )
+    _store_task(context, user_id, task)
 
 # --- MODO INMEDIATO ---
 async def handle_immediate_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,6 +354,7 @@ async def handle_immediate_video(update: Update, context: ContextTypes.DEFAULT_T
 # --- MENÚS Y COMANDOS PRINCIPALES ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    _clear_task(context, update.effective_user.id)
     await update.message.reply_text("👋 ¡Hola! Soy tu asistente de contenido.", reply_markup=MAIN_KEYBOARD)
 
 async def list_packs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -555,41 +610,8 @@ async def subtitle_search_start_callback(update: Update, context: ContextTypes.D
     context.user_data['state'] = 'awaiting_subtitle_search'
     context.user_data['pack_name'] = pack_name
     context.user_data['photo_id'] = photo_id_str
-    await query.message.reply_text("OK. ¿Qué película o serie busco? (Ej: `The Matrix` o `Breaking Bad S01E01`)", reply_markup=CANCEL_KEYBOARD)
+    await query.message.reply_text("OK. ¿Qué película o serie busco? (Ej: `The Matrix`)", reply_markup=CANCEL_KEYBOARD)
     await query.delete_message()
-
-async def subtitle_search_independent_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['state'] = 'awaiting_subtitle_search_independent'
-    await update.message.reply_text("OK. ¿Qué película o serie busco?", reply_markup=CANCEL_KEYBOARD)
-
-async def handle_subtitle_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query_text = update.message.text
-    await update.message.reply_text(f"🔎 Buscando subtítulos para '{query_text}'...")
-    subtitles, error_msg = sub_api.search_subtitles(query_text)
-    if error_msg:
-        await update.message.reply_text(f"❌ Error: {error_msg}", reply_markup=MAIN_KEYBOARD)
-        context.user_data.clear()
-        return
-    if not subtitles:
-        await update.message.reply_text("No se encontraron resultados. Intenta con otro nombre.", reply_markup=MAIN_KEYBOARD)
-        context.user_data.clear()
-        return
-    keyboard = []
-    state = context.user_data.get('state')
-    for sub in subtitles[:5]:
-        season = f" S{sub['season']:02d}" if sub['season'] else ""
-        episode = f"E{sub['episode']:02d}" if sub['episode'] else ""
-        label = f"({sub['language']}) {sub['movie_name']}{season}{episode}"
-        if state == 'awaiting_subtitle_search_independent':
-            callback_data = f"sub_download_independent:{sub['file_id']}"
-        else:
-            pack_name = context.user_data['pack_name']
-            photo_id_str = context.user_data['photo_id']
-            callback_data = f"sub_download_pack:{pack_name}:{photo_id_str}:{sub['file_id']}"
-        keyboard.append([InlineKeyboardButton(label, callback_data=callback_data)])
-    
-    keyboard.append([InlineKeyboardButton("❌ Cancelar Búsqueda", callback_data="cancel_subtitle_search")])
-    await update.message.reply_text("Resultados encontrados. Selecciona uno para descargar:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def subtitle_download_independent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -752,12 +774,8 @@ def main() -> None:
     except Exception as e:
         logger.critical(f"FATAL: Error al iniciar: {e}")
         return
-
-    async def shutdown_scheduler(app: Application):
-        if scheduler.running: scheduler.shutdown()
             
     builder = Application.builder().token(BOT_TOKEN)
-    builder.post_shutdown(shutdown_scheduler)
     application = builder.build()
     
     application.add_error_handler(error_handler)
@@ -767,6 +785,9 @@ def main() -> None:
     # Handlers para el teclado principal y texto general
     application.add_handler(CommandHandler("start", start_command, filters=admin_filter))
     application.add_handler(MessageHandler(filters.TEXT & admin_filter, handle_text))
+    
+    # MANEJADOR DE CANCELACIÓN UNIFICADO
+    application.add_handler(CallbackQueryHandler(cancel_task_callback, pattern="^cancel_task$"))
     
     # Handlers para menús inline
     application.add_handler(CallbackQueryHandler(list_packs_callback, pattern="^pack_list_"))

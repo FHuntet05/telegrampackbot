@@ -1,4 +1,4 @@
-# pro_mode.py (Versión Corregida 9 - Modo Paciente con Pausas de Cortesía)
+# pro_mode.py (Versión 10 - Cancelable)
 import os
 import asyncio
 import re
@@ -10,6 +10,7 @@ from telethon.tl.types import MessageService, PeerChannel
 from telethon.tl.functions.channels import EditPhotoRequest
 from telethon.errors.rpcerrorlist import FloodWaitError, ChannelPrivateError
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 
 # Cargar variables de entorno
 load_dotenv()
@@ -31,14 +32,12 @@ def clean_caption(original_caption: str | None) -> str:
     return re.sub(pattern, REPLACEMENT_USERNAME, original_caption)
 
 async def _send_with_retry(client_action, bot, user_chat_id):
-    """Función wrapper silenciosa para manejar FloodWaitError."""
     try:
         await client_action
         return True
     except FloodWaitError as fwe:
         if fwe.seconds > 10:
              await bot.send_message(user_chat_id, f"⏳ Telegram está ocupado. El bot esperará automáticamente {fwe.seconds} segundos y continuará.")
-        # Esperamos el tiempo solicitado + un margen
         await asyncio.sleep(fwe.seconds + 2)
         try:
             await client_action
@@ -49,10 +48,7 @@ async def _send_with_retry(client_action, bot, user_chat_id):
         return False
 
 async def _process_block(block: dict, bot, user_chat_id, client, my_channel_entity) -> tuple[int, int, str]:
-    """Función aislada para procesar un solo bloque de contenido."""
-    videos_sent = 0
-    errors = 0
-    
+    videos_sent, errors = 0, 0
     block_title = "Sin Título"
     if block["videos"] and block["videos"][0].text:
         block_title = block["videos"][0].text.split('\n')[0].strip()[:40] + "..."
@@ -70,8 +66,7 @@ async def _process_block(block: dict, bot, user_chat_id, client, my_channel_enti
                 return 0, errors, f"❌ *{block_title}*: Error al actualizar foto."
 
         for video_msg in block["videos"]:
-            # --- PAUSA PEQUEÑA ENTRE CADA VIDEO ---
-            await asyncio.sleep(1) 
+            await asyncio.sleep(1)
             new_caption = clean_caption(video_msg.text)
             action = client.send_file(my_channel_entity, video_msg.media, caption=new_caption)
             if await _send_with_retry(action, bot, user_chat_id):
@@ -88,19 +83,18 @@ async def _process_block(block: dict, bot, user_chat_id, client, my_channel_enti
             os.remove(photo_temp_path)
 
 
-async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, bot):
+async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, bot, status_message_id: int):
     """
-    Tarea principal que usa una lógica de acumulación con pausas de cortesía.
+    Tarea principal que ahora es cancelable y limpia su mensaje de estado al finalizar.
     """
-    total_blocks_processed = 0
-    total_videos_sent = 0
-    total_errors = 0
+    total_blocks_processed, total_videos_sent, total_errors = 0, 0, 0
     summary_details = []
+    task_cancelled = False
 
-    async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
-        try:
+    try:
+        async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
             me = await client.get_me()
-            await bot.send_message(user_chat_id, f"🤖 Agente '{me.first_name}' activado. Iniciando escaneo paciente para {post_count} bloques. Recibirás un informe al finalizar.")
+            await bot.send_message(user_chat_id, f"🤖 Agente '{me.first_name}' activado. Misión: procesar {post_count} bloques.")
 
             source_channel_id, start_msg_id = parse_private_link(start_link)
             if not source_channel_id:
@@ -115,8 +109,6 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
                  return
 
             current_block = {}
-            # --- PARÁMETRO CLAVE AÑADIDO: wait_time ---
-            # Le decimos a Telethon que espere 2 segundos entre cada petición de lote de mensajes.
             async for message in client.iter_messages(source_channel_entity, offset_id=start_msg_id, reverse=True, wait_time=2):
                 if total_blocks_processed >= post_count:
                     break
@@ -128,8 +120,7 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
                         total_errors += errs
                         summary_details.append(summary)
                         total_blocks_processed += 1
-                        # --- PAUSA ENTRE BLOQUES PROCESADOS ---
-                        await asyncio.sleep(3) 
+                        await asyncio.sleep(3)
                     
                     current_block = {"photo_msg": message, "videos": []}
                 
@@ -142,19 +133,34 @@ async def run_mirror_task(user_chat_id: int, start_link: str, post_count: int, b
                 total_errors += errs
                 summary_details.append(summary)
                 total_blocks_processed += 1
-        
-        except Exception as e:
-            await bot.send_message(user_chat_id, f"❌ MISIÓN ABORTADA: Error crítico general: {e}")
-            return
     
-    # --- Informe final ---
-    final_summary = (
-        f"🎉 **Misión Completada** 🎉\n\n"
-        f"📄 **Resumen de Operaciones:**\n"
-        f"- 🏙️ Bloques Procesados: *{total_blocks_processed} de {post_count} solicitados*\n"
-        f"- 📹 Videos Totales Enviados: *{total_videos_sent}*\n"
-        f"- ⚠️ Errores Encontrados: *{total_errors}*\n\n"
-        f"🔍 **Informe Detallado por Bloque:**\n"
-        f"{'\n'.join(summary_details) if summary_details else 'No se procesaron bloques con éxito.'}"
-    )
-    await bot.send_message(user_chat_id, final_summary, parse_mode=ParseMode.MARKDOWN)
+    except asyncio.CancelledError:
+        task_cancelled = True
+        await bot.send_message(user_chat_id, "🛑 **Misión Cancelada por el Usuario.**")
+    
+    except Exception as e:
+        await bot.send_message(user_chat_id, f"❌ MISIÓN ABORTADA: Error crítico general: {e}")
+    
+    finally:
+        # Enviar el informe final solo si no fue cancelada
+        if not task_cancelled:
+            final_summary = (
+                f"🎉 **Misión Completada** 🎉\n\n"
+                f"📄 **Resumen de Operaciones:**\n"
+                f"- 🏙️ Bloques Procesados: *{total_blocks_processed} de {post_count} solicitados*\n"
+                f"- 📹 Videos Totales Enviados: *{total_videos_sent}*\n"
+                f"- ⚠️ Errores Encontrados: *{total_errors}*\n\n"
+                f"🔍 **Informe Detallado por Bloque:**\n"
+                f"{'\n'.join(summary_details) if summary_details else 'No se procesaron bloques con éxito.'}"
+            )
+            await bot.send_message(user_chat_id, final_summary, parse_mode=ParseMode.MARKDOWN)
+
+        # Limpiar el mensaje de estado (quitar el botón de cancelar)
+        try:
+            await bot.edit_message_text(
+                chat_id=user_chat_id,
+                message_id=status_message_id,
+                text=f"✅ Tarea finalizada (estado: {'Cancelada' if task_cancelled else 'Completada'})."
+            )
+        except BadRequest:
+            pass # El mensaje podría haber sido borrado, lo ignoramos
