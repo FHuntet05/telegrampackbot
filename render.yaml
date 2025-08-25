@@ -1,0 +1,26 @@
+# render.yaml
+services:
+  - type: web
+    name: telegram-pack-bot-mongo
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.6
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: REPLACEMENT_USERNAME
+        value: "@estrenos_fh"
+      - key: ADMIN_USER_ID
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      # --- NUEVA VARIABLE ---
+      # Cambia 'Europe/Madrid' por tu zona horaria.
+      # Lista de zonas: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+      - key: TIMEZONE
+        value: "America/Bogota"
